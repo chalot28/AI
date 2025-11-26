@@ -4,34 +4,107 @@ const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const moment = require("moment-timezone");
+const https = require('https');
 
-// Fix lỗi fetch cho Node cũ
+// Fix lỗi fetch cho Node.js cũ
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
+// Lấy biến môi trường
 const {
   TELEGRAM_TOKEN,
-  GOOGLE_API_KEY,
+  GOOGLE_CHAT_KEYS,
+  VOICERSS_KEYS,
+  SERPER_API_KEY,    // KEY SERPER (TÌM KIẾM)
   SELF_PING_URL,
   GOOGLE_APP_SCRIPT_URL: GAS_URL,
   PORT = 3000
 } = process.env;
 
-if (!TELEGRAM_TOKEN || !GOOGLE_API_KEY || !GAS_URL) {
-  console.error("❌ LỖI: Thiếu Token, Key hoặc Link Google Script trong file .env");
+// Kiểm tra biến môi trường quan trọng
+if (!TELEGRAM_TOKEN || !GOOGLE_CHAT_KEYS || !GAS_URL) {
+  console.error("❌ LỖI: Thiếu Token hoặc Keys cơ bản trong .env");
   process.exit(1);
 }
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; 
-const REQUEST_TIMEOUT = 15000;
+const REQUEST_TIMEOUT = 60000; 
+const MODEL_CHAT = "gemini-2.0-flash"; // Dùng bản Flash mới nhất cho nhanh
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
-
 const app = express();
 app.use(express.json());
 
-// ================== 2. CÁC HÀM TIỆN ÍCH ==================
+// ================== 2. QUẢN LÝ KEY (SMART ROTATION) ==================
+
+// 2.1 Quản lý Key GEMINI
+class KeyManager {
+  constructor(keysString, name) {
+    this.name = name;
+    this.keys = keysString.split(",").map(k => k.trim()).filter(k => k);
+    this.currentIndex = 0;
+    console.log(`✅ [${name}] Đã nạp ${this.keys.length} API Keys.`);
+  }
+
+  getCurrentClient() {
+    return new GoogleGenerativeAI(this.keys[this.currentIndex]);
+  }
+
+  rotate() {
+    this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+    console.log(`⚠️ [${this.name}] Đổi sang Key số ${this.currentIndex + 1}...`);
+  }
+
+  async executeWithRetry(operationFunc) {
+    let attempts = this.keys.length === 1 ? 3 : this.keys.length;
+    while (attempts > 0) {
+      try {
+        const client = this.getCurrentClient();
+        return await operationFunc(client);
+      } catch (error) {
+        const msg = (error.message || "").toLowerCase();
+        console.error(`🔴 [${this.name}] Lỗi:`, msg);
+        
+        if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted")) {
+          if (this.keys.length === 1) {
+            await new Promise(r => setTimeout(r, 5000)); // Đợi 5s nếu chỉ có 1 key
+            attempts--;
+            continue;
+          }
+          this.rotate(); // Đổi key nếu có nhiều key
+          attempts--;
+        } else {
+          throw error;
+        }
+      }
+    }
+    throw new Error(`[${this.name}] Hệ thống bận.`);
+  }
+}
+
+// 2.2 Quản lý Key VOICE RSS
+class VoiceKeyManager {
+  constructor(keysString) {
+    this.name = "VOICE-RSS";
+    this.keys = (keysString || "").split(",").map(k => k.trim()).filter(k => k);
+    this.currentIndex = 0;
+    if (this.keys.length > 0) console.log(`✅ [${this.name}] Đã nạp ${this.keys.length} API Keys.`);
+    else console.warn(`⚠️ [${this.name}] Chưa cấu hình Key trong .env!`);
+  }
+  getKey() {
+    if (this.keys.length === 0) throw new Error("Chưa cấu hình VOICERSS_KEYS");
+    return this.keys[this.currentIndex];
+  }
+  rotate() {
+    if (this.keys.length <= 1) return;
+    this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+    console.log(`⚠️ [${this.name}] Đổi sang Key số ${this.currentIndex + 1}...`);
+  }
+}
+
+const chatManager = new KeyManager(GOOGLE_CHAT_KEYS, "CHAT-GEMINI");
+const voiceManager = new VoiceKeyManager(VOICERSS_KEYS);
+
+// ================== 3. TIỆN ÍCH MẠNG ==================
 
 async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
@@ -43,6 +116,19 @@ async function fetchWithTimeout(url, options = {}) {
   } catch (error) {
     clearTimeout(id);
     throw error;
+  }
+}
+
+async function fetchWithRetry(url, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetchWithTimeout(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      await new Promise(r => setTimeout(r, 1000));
+    }
   }
 }
 
@@ -59,48 +145,20 @@ function fileToGenerativePart(buffer, mimeType) {
   return { inlineData: { data: buffer.toString("base64"), mimeType } };
 }
 
-// ================== 3. KẾT NỐI GOOGLE SHEETS ==================
-
+// ================== 4. GOOGLE SHEETS ==================
 async function getRemindersFromSheet() {
-  try {
-    const res = await fetchWithTimeout(GAS_URL);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    return Array.isArray(data) ? data : [];
-  } catch (e) {
-    console.error("⚠️ Lỗi đọc Sheet:", e.message);
-    return [];
-  }
+  try { return await (await fetchWithTimeout(GAS_URL)).json(); } catch (e) { return []; }
 }
-
-async function addReminderToSheet(chatId, targetTime, note, type) {
+async function addReminderToSheet(chatId, t, n, type) {
   const id = Date.now().toString().slice(-6);
-  const payload = {
-    action: "add",
-    id: id,
-    chatId: chatId,
-    time: targetTime.toISOString(),
-    note: note,
-    type: type
-  };
-  fetchWithTimeout(GAS_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  }).catch(e => console.error("⚠️ Lỗi ghi Sheet:", e.message));
+  fetchWithTimeout(GAS_URL, { method: "POST", body: JSON.stringify({ action: "add", id, chatId, time: t.toISOString(), note: n, type }) }).catch(console.error);
   return id;
 }
-
 async function deleteReminderFromSheet(id) {
-  fetchWithTimeout(GAS_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "delete", id: id })
-  }).catch(e => console.error("⚠️ Lỗi xóa Sheet:", e.message));
+  fetchWithTimeout(GAS_URL, { method: "POST", body: JSON.stringify({ action: "delete", id }) }).catch(console.error);
 }
 
-// ================== 4. QUẢN LÝ TRẠNG THÁI & AI ==================
-
+// ================== 5. TRẠNG THÁI ==================
 const userStates = new Map();
 function setUserProcessing(chatId, isProcessing, requestId = 0) {
   if (!isProcessing) userStates.delete(chatId);
@@ -110,66 +168,183 @@ function getUserState(chatId) {
   return userStates.get(chatId) || { isProcessing: false, requestId: 0 };
 }
 
-async function askGemini(promptText, imageBuffer = null) {
-  try {
+// ================== 6. AI & MEDIA LOGIC ==================
+
+// 6.1 Chat Gemini (Xử lý Context từ Google Search)
+async function askGemini(promptText, imageBuffer = null, searchContext = null) {
+  return chatManager.executeWithRetry(async (client) => {
+    const model = client.getGenerativeModel({ model: MODEL_CHAT });
     const parts = [];
     if (imageBuffer) parts.push(fileToGenerativePart(imageBuffer, "image/jpeg"));
-    if (!promptText && imageBuffer) promptText = "Mô tả chi tiết bức ảnh này.";
-    parts.push({ text: `Bạn là trợ lý ảo hữu ích. Trả lời ngắn gọn. User: ${promptText || "Xin chào"}` });
-    const result = await geminiModel.generateContent(parts);
+    
+    // Nếu có thông tin tìm kiếm, chèn vào prompt hệ thống
+    let systemPrompt = "Bạn là trợ lý ảo thông minh.";
+    if (searchContext) {
+      systemPrompt += `\n[THÔNG TIN TỪ GOOGLE]\n${searchContext}\n\nHãy trả lời câu hỏi của người dùng dựa trên thông tin trên. Nếu có số liệu, hãy trích dẫn nguồn hoặc tiêu đề bài viết.`;
+    }
+
+    if (!promptText && imageBuffer) promptText = "Mô tả ảnh này.";
+    parts.push({ text: `${systemPrompt}\n\nUser: ${promptText || "Xin chào"}` });
+    
+    const result = await model.generateContent(parts);
     return result.response.text();
-  } catch (err) {
-    console.error("Gemini Error:", err.message);
-    return "Hệ thống đang bận hoặc nội dung bị chặn.";
-  }
+  });
 }
 
+// 6.2 TÌM KIẾM GOOGLE (SERPER API) - QUAN TRỌNG NHẤT
+async function performSearch(query) {
+    if (!SERPER_API_KEY) {
+        console.error("❌ CHƯA CÓ SERPER_API_KEY TRONG FILE .ENV");
+        return null;
+    }
+    
+    try {
+        const myHeaders = new Headers();
+        myHeaders.append("X-API-KEY", SERPER_API_KEY);
+        myHeaders.append("Content-Type", "application/json");
+
+        const raw = JSON.stringify({
+            "q": query,
+            "gl": "vn",    // Vị trí: Việt Nam
+            "hl": "vi",    // Ngôn ngữ: Tiếng Việt
+            "num": 5       // Lấy 5 kết quả
+        });
+
+        const requestOptions = {
+            method: 'POST',
+            headers: myHeaders,
+            body: raw,
+            redirect: 'follow'
+        };
+
+        // Gọi API Serper
+        const res = await fetch("https://google.serper.dev/search", requestOptions);
+        if (!res.ok) throw new Error(`Lỗi Serper API: ${res.status}`);
+        
+        const data = await res.json();
+        
+        // Kiểm tra kết quả
+        if (!data.organic || data.organic.length === 0) return null;
+
+        let context = "";
+        
+        // 1. Lấy câu trả lời nhanh (nếu có)
+        if (data.answerBox) {
+            context += `💡 TRẢ LỜI NHANH: ${data.answerBox.title || ""} - ${data.answerBox.snippet || data.answerBox.answer || ""}\n\n`;
+        }
+        
+        // 2. Lấy danh sách bài viết (Title + Link + Snippet)
+        context += data.organic.map((r, index) => 
+            `[${index + 1}] ${r.title}\nLink: ${r.link}\nNội dung: ${r.snippet}`
+        ).join("\n\n");
+
+        return context;
+
+    } catch (e) {
+        console.error("Lỗi tìm kiếm Serper:", e.message);
+        return null;
+    }
+}
+
+// 6.3 Tạo ảnh (Flux - Pollinations)
 async function generateImage(prompt) {
-  try {
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
-    const res = await fetchWithTimeout(url);
-    if (!res.ok) throw new Error("API Error");
-    return { buffer: Buffer.from(await res.arrayBuffer()) };
-  } catch (e) {
-    throw new Error("Không thể vẽ tranh lúc này.");
-  }
+    const randomSeed = Math.floor(Math.random() * 1000000);
+    const encodedPrompt = encodeURIComponent(prompt);
+    
+    // Danh sách nguồn vẽ dự phòng
+    const urls = [
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?model=flux&width=1024&height=1024&seed=${randomSeed}&nologo=true`,
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?model=turbo&seed=${randomSeed}&nologo=true`,
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?seed=${randomSeed}&nologo=true`
+    ];
+    
+    const agent = new https.Agent({ rejectUnauthorized: false });
+
+    const tryFetchImage = async (url) => {
+        const controller = new AbortController();
+        const id = setTimeout(() => controller.abort(), 40000); 
+        try {
+            const res = await fetch(url, { agent: agent, signal: controller.signal });
+            clearTimeout(id);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const arrayBuffer = await res.arrayBuffer();
+            if (arrayBuffer.byteLength < 1000) throw new Error("Ảnh lỗi");
+            return Buffer.from(arrayBuffer);
+        } catch (error) {
+            clearTimeout(id);
+            throw error;
+        }
+    };
+
+    for (let i = 0; i < urls.length; i++) {
+        try {
+            const buffer = await tryFetchImage(urls[i]);
+            return { buffer: buffer };
+        } catch (err) {
+            // Thử link tiếp theo nếu lỗi
+        }
+    }
+    throw new Error("Server vẽ đang bận, thử lại sau.");
 }
 
-// ================== 5. XỬ LÝ LOGIC LỆNH (/nn) ==================
+// 6.4 Tạo giọng nói (VoiceRSS - Có xoay vòng)
+async function generateVoice(text) {
+  let attempts = voiceManager.keys.length > 0 ? voiceManager.keys.length : 1;
+  while (attempts > 0) {
+    try {
+      const apiKey = voiceManager.getKey();
+      const url = `https://api.voicerss.org/?key=${apiKey}&hl=vi-vn&c=MP3&f=44khz_16bit_stereo&src=${encodeURIComponent(text)}`;
+      const res = await fetchWithTimeout(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      
+      // Check lỗi Text trả về thay vì Audio
+      if (buffer.length < 300) {
+         const errText = buffer.toString('utf-8');
+         if (errText.startsWith("ERROR")) throw new Error(errText);
+      }
+      return buffer;
+    } catch (error) {
+      // Nếu lỗi do Key/Quota thì đổi Key
+      if (voiceManager.keys.length > 1) {
+          console.warn(`⚠️ Voice Key lỗi: ${error.message}. Đang đổi Key...`);
+          voiceManager.rotate();
+          attempts--;
+          continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error("Tất cả Key VoiceRSS đều lỗi hoặc hết lượt.");
+}
+
+// ================== 7. XỬ LÝ TIN NHẮN (BOT HANDLER) ==================
 
 async function handleReminderCommand(chatId, text) {
   const content = text.replace(/^\/nn\s*/i, "").trim();
-  if (!content) return "⚠️ Sai cú pháp.\nVD: `/nn 9:30` (mỗi ngày)\nVD: `/nn 10:30/24/11 đi họp` (1 lần)";
-
+  if (!content) return "⚠️ Sai cú pháp. VD: `/nn 9:30`";
   const parts = content.split(" ");
   const timeStr = parts[0];
-  const note = parts.slice(1).join(" ") || "Đến giờ rồi! ⏰";
-
+  const note = parts.slice(1).join(" ") || "Reminder";
   let targetTime = moment().tz("Asia/Ho_Chi_Minh");
   let type = "ONE_TIME";
 
   if (timeStr.includes("/")) {
     const [t, d, m] = timeStr.split("/");
-    const timeObj = parseTime(t);
-    if (!timeObj || isNaN(parseInt(d)) || isNaN(parseInt(m))) return "❌ Định dạng sai.";
-    targetTime.hour(timeObj.h).minute(timeObj.m).second(0).date(d).month(m - 1);
+    const to = parseTime(t);
+    if (!to) return "❌ Lỗi giờ.";
+    targetTime.hour(to.h).minute(to.m).second(0).date(d).month(m - 1);
     if (targetTime.isBefore(moment())) targetTime.add(1, 'year');
-    type = "ONE_TIME";
   } else {
-    const timeObj = parseTime(timeStr);
-    if (!timeObj) return "❌ Giờ sai.";
-    targetTime.hour(timeObj.h).minute(timeObj.m).second(0);
+    const to = parseTime(timeStr);
+    if (!to) return "❌ Lỗi giờ.";
+    targetTime.hour(to.h).minute(to.m).second(0);
     if (targetTime.isBefore(moment())) targetTime.add(1, "days");
     type = "DAILY";
   }
-
   const id = await addReminderToSheet(chatId, targetTime, note, type);
-  const timeDisplay = targetTime.format("HH:mm DD/MM/YYYY");
-  const typeDisplay = type === "DAILY" ? "Mỗi ngày" : "Một lần";
-  return `✅ Đã lưu Reminder!\n⏰ Hẹn: *${timeDisplay}*\n📝 Note: ${note}\n🔄 Loại: ${typeDisplay}\n🆔 Mã: \`${id}\``;
+  return `✅ Đã hẹn: *${targetTime.format("HH:mm DD/MM")}*\n📝 ${note}`;
 }
-
-// ================== 6. BOT MESSAGE HANDLER (MAIN) ==================
 
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
@@ -178,129 +353,151 @@ bot.on("message", async (msg) => {
   const hasDocument = msg.document;
 
   if (!text && !hasPhoto && !hasDocument) return;
-  console.log(`📩 [${chatId}] ${text.substring(0, 50)}...`);
+  console.log(`📩 [${chatId}] ${text.substring(0, 30)}...`);
 
-  // --- A. LỆNH HỆ THỐNG & HỦY (KHÔNG BAO GIỜ BỊ KHÓA) ---
-
-  // 1. Hủy tác vụ
+  // Hủy tác vụ
   if (text.trim() === "//") {
-    setUserProcessing(chatId, false); // Mở khóa ngay lập tức
-    return bot.sendMessage(chatId, "✅ Đã hủy trạng thái bận. Bạn có thể chat tiếp.");
+    setUserProcessing(chatId, false);
+    return bot.sendMessage(chatId, "✅ Đã hủy tác vụ.");
   }
-
-  // 2. Lệnh nhắc nhở (/nn)
+  
+  // === CÁC LỆNH HỆ THỐNG ===
   if (text.toLowerCase().startsWith("/nn")) {
-    // Lệnh này chạy độc lập, KHÔNG check trạng thái bận
-    const reply = await handleReminderCommand(chatId, text);
-    return bot.sendMessage(chatId, reply, { parse_mode: "Markdown" });
+    const r = await handleReminderCommand(chatId, text);
+    return bot.sendMessage(chatId, r, { parse_mode: "Markdown" });
   }
-
-  // 3. Lệnh xem nhắc nhở (/bt)
   if (text.toLowerCase() === "/bt") {
-    bot.sendMessage(chatId, "⏳ Đang tải dữ liệu...");
+    bot.sendMessage(chatId, "⏳ Đang tải...");
     const all = await getRemindersFromSheet();
     const mine = all.filter(r => r.chatId == chatId);
-    if (!mine.length) return bot.sendMessage(chatId, "📭 Bạn không có lịch nhắc nào.");
-    let reply = `📋 **Danh sách (${mine.length}):**\n`;
-    mine.forEach(r => {
-      const t = moment(r.time).tz("Asia/Ho_Chi_Minh").format("HH:mm DD/MM");
-      reply += `\n🆔 \`${r.id}\` | ⏰ ${t} | 📝 ${r.note}`;
-    });
-    reply += `\n\n_Xóa: /dtb + mã_`;
-    return bot.sendMessage(chatId, reply, { parse_mode: "Markdown" });
+    if (!mine.length) return bot.sendMessage(chatId, "📭 Trống.");
+    let r = mine.map(i => `\n🆔 \`${i.id}\` | ⏰ ${moment(i.time).tz("Asia/Ho_Chi_Minh").format("HH:mm DD/MM")} | ${i.note}`).join("");
+    return bot.sendMessage(chatId, `📋 **Danh sách:**\n${r}\n\n_Xóa: /dtb + mã_`, { parse_mode: "Markdown" });
   }
-
-  // 4. Lệnh xóa nhắc nhở (/dtb)
   if (text.toLowerCase().startsWith("/dtb")) {
     const id = text.replace(/\/dtb/i, "").trim();
-    if(!id) return bot.sendMessage(chatId, "⚠️ Nhập mã cần xóa. VD: `/dtb 123456`");
     await deleteReminderFromSheet(id);
-    return bot.sendMessage(chatId, `🗑️ Đã gửi lệnh xóa mã \`${id}\`.`);
+    return bot.sendMessage(chatId, `🗑️ Đã xóa mã \`${id}\`.`);
   }
 
-  // --- B. XỬ LÝ AI (CÓ QUEUE - CẦN KHÓA) ---
-  
-  // Kiểm tra xem có đang bận không
+  // === AI XỬ LÝ (Chat, Ảnh, Voice, Tìm kiếm) ===
   const state = getUserState(chatId);
-  if (state.isProcessing) {
-    return bot.sendMessage(chatId, "⚠️ Đang xử lý lệnh trước... (gõ `//` nếu muốn hủy ngay).");
-  }
+  if (state.isProcessing) return bot.sendMessage(chatId, "⚠️ Đang bận (gõ `//` để hủy).");
 
-  // Bắt đầu KHÓA
   const reqId = Date.now();
   setUserProcessing(chatId, true, reqId);
 
   try {
-    // 1. Vẽ tranh (/img)
+    // 1. TẠO ẢNH (FLUX)
     if (text.match(/^\/img|^\/image/i)) {
       const prompt = text.replace(/^\/(img|image)\s*/i, "").trim();
-      if (!prompt) {
-        await bot.sendMessage(chatId, "⚠️ Thiếu nội dung vẽ.");
-      } else {
-        await bot.sendMessage(chatId, "🎨 Đang vẽ...");
-        const img = await generateImage(prompt);
-        // Chỉ gửi nếu chưa bị hủy
-        if (getUserState(chatId).requestId === reqId) {
-          await bot.sendPhoto(chatId, img.buffer, { caption: prompt });
-        }
+      if(!prompt) { setUserProcessing(chatId, false); return bot.sendMessage(chatId, "⚠️ Thiếu mô tả ảnh."); }
+      await bot.sendMessage(chatId, "🎨 Đang vẽ (Chế độ FLUX)...");
+      
+      const img = await generateImage(prompt);
+      
+      if (getUserState(chatId).requestId === reqId) {
+        await bot.sendPhoto(chatId, img.buffer, { caption: `Prompt: ${prompt}\n✨ Model: FLUX` });
       }
-      // QUAN TRỌNG: Mở khóa ngay sau khi xong việc vẽ
-      setUserProcessing(chatId, false); 
-      return; 
+      setUserProcessing(chatId, false);
+      return;
     }
 
-    // 2. Chat Gemini (Text/Image/File)
+    // 2. GIỌNG NÓI (VOICE RSS)
+    if (text.toLowerCase().startsWith("/voi")) {
+      const contentToSpeak = text.replace(/^\/voi\s*/i, "").trim();
+      if(!contentToSpeak) { setUserProcessing(chatId, false); return bot.sendMessage(chatId, "⚠️ Nhập nội dung cần đọc."); }
+      await bot.sendChatAction(chatId, "record_voice");
+      
+      const audioBuffer = await generateVoice(contentToSpeak);
+      
+      if (getUserState(chatId).requestId === reqId) {
+        await bot.sendVoice(chatId, audioBuffer);
+      }
+      setUserProcessing(chatId, false);
+      return;
+    }
+
+    // 3. TÌM KIẾM GOOGLE (SERPER) - FEATURE MỚI
+    let searchContext = null;
+    if (text.toLowerCase().startsWith("/tim")) {
+      const query = text.replace(/^\/tim\s*/i, "").trim();
+      if(!query) { setUserProcessing(chatId, false); return bot.sendMessage(chatId, "⚠️ Nhập từ khóa cần tìm."); }
+      
+      await bot.sendMessage(chatId, `🌐 Đang tìm trên Google: *${query}*...`, { parse_mode: "Markdown" });
+      
+      const searchResults = await performSearch(query);
+      
+      if (!searchResults) {
+         if (getUserState(chatId).requestId === reqId) await bot.sendMessage(chatId, "❌ Không tìm thấy kết quả hoặc lỗi Key Serper.");
+         setUserProcessing(chatId, false);
+         return;
+      }
+      
+      // Lưu kết quả tìm kiếm vào biến context
+      searchContext = searchResults;
+      
+      // Sửa lại câu hỏi để Gemini biết nhiệm vụ
+      text = `User tìm kiếm: "${query}".\nDựa vào các kết quả tìm kiếm mới nhất dưới đây, hãy tổng hợp câu trả lời chi tiết và chính xác nhất cho User.`;
+    }
+
+    // 4. CHAT GEMINI (Và xử lý File/Ảnh)
     let imageBuffer = null;
-    
-    // Tải dữ liệu (Có thể lâu)
-    if (hasDocument) await bot.sendMessage(chatId, "📂 Đang đọc file code (giới hạn 10MB)...");
+    if (hasDocument) await bot.sendMessage(chatId, "📂 Đang đọc file...");
     else if (hasPhoto) await bot.sendMessage(chatId, "👁️ Đang xem ảnh...");
     else bot.sendChatAction(chatId, "typing");
 
     if (hasPhoto) {
-      const fileId = msg.photo[msg.photo.length - 1].file_id;
-      const link = await bot.getFileLink(fileId);
-      const res = await fetchWithTimeout(link);
+      const link = await bot.getFileLink(msg.photo[msg.photo.length - 1].file_id);
+      const res = await fetchWithRetry(link);
       imageBuffer = Buffer.from(await res.arrayBuffer());
     }
-
     if (hasDocument) {
-      if (msg.document.file_size > MAX_FILE_SIZE) throw new Error("File quá lớn (>10MB).");
+      if (msg.document.file_size > MAX_FILE_SIZE) throw new Error("File > 10MB.");
       const link = await bot.getFileLink(msg.document.file_id);
-      const res = await fetchWithTimeout(link);
+      const res = await fetchWithRetry(link);
       const content = Buffer.from(await res.arrayBuffer()).toString("utf-8");
-      text += `\n\n[FILE CONTENT: ${msg.document.file_name}]\n\`\`\`\n${content}\n\`\`\``;
+      text += `\n\n[FILE: ${msg.document.file_name}]\n\`\`\`\n${content}\n\`\`\``;
     }
 
-    // Check hủy trước khi gọi AI
     if (getUserState(chatId).requestId !== reqId) return;
 
-    // Gọi AI
-    const ans = await askGemini(text, imageBuffer);
+    // Gọi Gemini (Truyền thêm searchContext nếu có)
+    const ans = await askGemini(text, imageBuffer, searchContext);
 
-    // Gửi kết quả và MỞ KHÓA
+    // ================== FIXED ERROR 400 HERE ==================
     if (getUserState(chatId).requestId === reqId) {
+      
+      // Hàm gửi tin nhắn an toàn (Tự động chuyển text thường nếu Markdown lỗi)
+      const sendSafeMessage = async (contentStr) => {
+        try {
+          await bot.sendMessage(chatId, contentStr, { parse_mode: "Markdown" });
+        } catch (e) {
+          console.warn(`⚠️ Markdown lỗi (${e.message}), đang gửi lại dạng text thô...`);
+          // Gửi lại không dùng parse_mode
+          await bot.sendMessage(chatId, contentStr); 
+        }
+      };
+
+      // Cắt tin nhắn nếu quá dài (Telegram giới hạn 4096 ký tự)
       if (ans.length > 4000) {
         const chunks = ans.match(/.{1,4000}/g) || [];
-        for (const c of chunks) await bot.sendMessage(chatId, c, { parse_mode: "Markdown" });
+        for (const c of chunks) await sendSafeMessage(c);
       } else {
-        await bot.sendMessage(chatId, ans, { parse_mode: "Markdown" });
+        await sendSafeMessage(ans);
       }
     }
+    // ==========================================================
+
   } catch (err) {
-    console.error(`Error User ${chatId}:`, err.message);
-    if (getUserState(chatId).requestId === reqId) {
-      bot.sendMessage(chatId, `❌ Lỗi: ${err.message}`);
-    }
+    console.error(`User ${chatId} Error:`, err.message);
+    if (getUserState(chatId).requestId === reqId) bot.sendMessage(chatId, `❌ Lỗi: ${err.message}`);
   } finally {
-    // Đảm bảo luôn mở khóa dù có lỗi hay không (Chỉ mở nếu đúng là phiên của mình)
-    if (getUserState(chatId).requestId === reqId) {
-      setUserProcessing(chatId, false);
-    }
+    if (getUserState(chatId).requestId === reqId) setUserProcessing(chatId, false);
   }
 });
 
-// ================== 7. CRON JOB ==================
+// ================== 8. SERVER & CRON JOB ==================
 setInterval(async () => {
   const all = await getRemindersFromSheet();
   if (!all.length) return;
@@ -309,25 +506,23 @@ setInterval(async () => {
     try {
       const target = moment(r.time);
       if (now.isSameOrAfter(target, 'minute')) {
-        await bot.sendMessage(r.chatId, `⏰ **NHẮC NHỞ:**\n${r.note}`, { parse_mode: "Markdown" }).catch(() => {});
+        await bot.sendMessage(r.chatId, `⏰ **NHẮC:** ${r.note}`, { parse_mode: "Markdown" }).catch(() => {});
         await deleteReminderFromSheet(r.id);
         if (r.type === "DAILY") {
-          const nextTime = target.add(1, "days");
-          await new Promise(res => setTimeout(res, 1000)); 
-          await addReminderToSheet(r.chatId, nextTime, r.note, "DAILY");
+          await new Promise(res => setTimeout(res, 1000));
+          await addReminderToSheet(r.chatId, target.add(1, "days"), r.note, "DAILY");
         }
       }
-    } catch (e) { console.error("Cron Error:", e.message); }
+    } catch (e) {}
   }
-}, 60 * 1000);
+}, 60000);
 
-// ================== 8. SERVER ==================
-if (SELF_PING_URL) setInterval(() => fetch(SELF_PING_URL + "/health").catch(() => {}), 5 * 60 * 1000);
+if (typeof SELF_PING_URL !== 'undefined' && SELF_PING_URL) {
+  setInterval(() => fetch(SELF_PING_URL + "/health").catch(() => {}), 300000);
+}
 
-app.get("/", (req, res) => res.send("🤖 Bot V5 - Stable & No Lock Bug 🚀"));
+app.get("/", (req, res) => res.send("🤖 Bot V18 - FIX ERROR 400 🚀"));
 app.get("/health", (req, res) => res.json({ status: "ok" }));
-
-process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
-process.on('unhandledRejection', (reason, promise) => console.error('Unhandled Rejection:', reason));
-
+process.on('uncaughtException', (err) => console.error(err));
+process.on('unhandledRejection', (reason) => console.error(reason));
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
