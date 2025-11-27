@@ -5,6 +5,7 @@ const TelegramBot = require("node-telegram-bot-api");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const moment = require("moment-timezone");
 const https = require('https');
+const fs = require('fs'); // [MỚI] Thêm thư viện đọc file
 
 // Fix lỗi fetch cho Node.js cũ
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
@@ -30,7 +31,7 @@ if (!TELEGRAM_TOKEN || !GOOGLE_CHAT_KEYS || !GAS_URL) {
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; 
 const REQUEST_TIMEOUT = 60000; 
-const MODEL_GEMINI = "gemini-2.5-flash"; 
+const MODEL_GEMINI = "gemini-1.5-flash"; 
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const app = express();
@@ -132,7 +133,7 @@ class ChatContextManager {
   }
 }
 
-// 2.4 Quản lý giới hạn sử dụng (RAM Optimized) - Dùng cho /check
+// 2.4 Quản lý giới hạn sử dụng (RAM Optimized)
 class TemporaryUsageManager {
   constructor() {
     this.usageMap = new Map(); 
@@ -175,7 +176,7 @@ const voiceManager = new VoiceKeyManager(VOICERSS_KEYS);
 const contextManager = new ChatContextManager(); 
 const usageManager = new TemporaryUsageManager(); 
 
-// ================== 3. TIỆN ÍCH MẠNG & SEARCH NÂNG CAO ==================
+// ================== 3. TIỆN ÍCH MẠNG & SEARCH ==================
 
 async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
@@ -203,12 +204,10 @@ async function fetchWithRetry(url, retries = 3) {
   }
 }
 
-// [NÂNG CẤP] Search Đa Chiều (Multi-threaded Search)
-// Kết hợp thuật toán search bạn cung cấp vào flow cũ
+// Search Đa Chiều
 async function performComprehensiveSearch(query) {
     if (!SERPER_API_KEY) return null;
 
-    // Chạy song song 2 luồng: Search thường và News
     const searchTypes = [
         { q: query, type: "search" },              
         { q: `${query} fact check`, type: "news" }
@@ -235,7 +234,7 @@ async function performComprehensiveSearch(query) {
             if (searchData.organic) combinedContext += searchData.organic.map(r => `[WEB] ${r.title}\nLink: ${r.link}\nInfo: ${r.snippet}`).join("\n\n");
         }
 
-        // 2. Kết quả News (nếu có)
+        // 2. Kết quả News
         const newsData = results[1];
         if (newsData && newsData.news) {
              combinedContext += "\n\n📰 TIN TỨC LIÊN QUAN:\n" + newsData.news.map(n => `[NEWS] ${n.title} (${n.date || ""})\nInfo: ${n.snippet}`).join("\n\n");
@@ -275,9 +274,8 @@ async function generateVoice(text) {
   throw new Error("Lỗi Voice.");
 }
 
-// ================== 4. AI LOGIC (HYBRID) ==================
+// ================== 4. AI LOGIC ==================
 
-// [MỚI] Prompt tạo JSON để Fact Check chuẩn xác
 function buildVerificationPrompt(query, searchContext) {
     return `
 Bạn là chuyên gia kiểm chứng thông tin (Fact-Checker).
@@ -290,14 +288,14 @@ ${searchContext}
 
 YÊU CẦU:
 1. Phân tích độ chính xác (Đúng/Sai/Không rõ/Một phần).
-2. Đưa ra bằng chứng cụ thể từ dữ liệu tìm kiếm.
-3. Trích dẫn nguồn (nếu có link).
+2. Đưa ra bằng chứng cụ thể.
+3. Trích dẫn nguồn.
 
-⚠️ BẮT BUỘC TRẢ LỜI ĐÚNG ĐỊNH DẠNG JSON SAU (KHÔNG MARKDOWN):
+⚠️ BẮT BUỘC TRẢ LỜI ĐÚNG ĐỊNH DẠNG JSON SAU:
 {
   "verified": "ĐÚNG | SAI | KHÔNG RÕ | MỘT PHẦN",
   "confidence": "CAO | TRUNG BÌNH | THẤP",
-  "summary": "Tóm tắt ngắn gọn kết luận",
+  "summary": "Tóm tắt ngắn gọn",
   "reasoning": "Giải thích chi tiết (3-4 câu)",
   "evidence": ["Bằng chứng 1", "Bằng chứng 2"],
   "sources": ["Nguồn 1", "Nguồn 2"]
@@ -325,31 +323,25 @@ async function callGemini(prompt, imageBuffer, systemPrompt) {
     });
 }
 
-// Hàm AI Tổng hợp
 async function askHybridAI(promptText, imageBuffer = null, searchContext = null, isJsonMode = false) {
     let systemPrompt = isJsonMode 
         ? "Bạn là hệ thống xử lý dữ liệu JSON. Chỉ trả về JSON thuần túy." 
         : "Bạn là trợ lý ảo hữu ích.";
     
-    // Nếu là chế độ Fact Check, dùng prompt chuyên biệt
     let finalPrompt = promptText; 
     
-    // Nếu là Chat thường có Search
     if (searchContext && !isJsonMode) {
         systemPrompt += `\n\n[DỮ LIỆU TÌM KIẾM]\n${searchContext}\nTrả lời dựa trên thông tin này.`;
     }
 
-    // 1. Gemini (Ưu tiên nếu có ảnh)
     if (imageBuffer) return await callGemini(finalPrompt, imageBuffer, systemPrompt);
 
-    // 2. Groq (Ưu tiên Text/JSON vì nhanh)
     try {
         return await callGroq(finalPrompt, systemPrompt);
     } catch (e) {
         console.warn("Groq lỗi, chuyển Gemini...");
     }
 
-    // 3. Gemini Backup
     try {
         return await callGemini(finalPrompt, null, systemPrompt);
     } catch (e) {
@@ -357,34 +349,28 @@ async function askHybridAI(promptText, imageBuffer = null, searchContext = null,
     }
 }
 
-// ================== 5. XỬ LÝ FACT CHECK LOGIC (CORE MỚI) ==================
+// ================== 5. FACT CHECK CORE ==================
 
 async function processFactCheck(chatId, query, imageBuffer = null) {
-    // B1: Nếu có ảnh, trích xuất thông tin trước
     let queryToSearch = query;
     let extractedInfo = "";
     
     if (imageBuffer) {
-        // Dùng Gemini Vision để đọc ảnh
         const extractPrompt = "Hãy liệt kê các sự kiện, văn bản, hoặc tuyên bố chính trong bức ảnh này để tôi kiểm chứng sự thật.";
         extractedInfo = await askHybridAI(extractPrompt, imageBuffer);
-        queryToSearch = `${query} ${extractedInfo}`.substring(0, 400); // Lấy kết quả làm từ khóa
+        queryToSearch = `${query} ${extractedInfo}`.substring(0, 400); 
     }
 
-    // B2: Search Đa Chiều
     const searchContext = await performComprehensiveSearch(queryToSearch);
     if (!searchContext) return "❌ Không tìm thấy thông tin nào để kiểm chứng.";
 
-    // B3: AI Phân tích & Trả JSON
     const verificationPrompt = buildVerificationPrompt(queryToSearch, searchContext);
     const rawJson = await askHybridAI(verificationPrompt, null, null, true);
 
-    // B4: Format kết quả đẹp
     try {
         const jsonMatch = rawJson.match(/\{[\s\S]*\}/);
         const data = JSON.parse(jsonMatch ? jsonMatch[0] : rawJson);
 
-        // Icon trạng thái
         const v = data.verified.toUpperCase();
         const icon = v.includes("ĐÚNG") ? "✅" : (v.includes("SAI") ? "❌" : "⚠️");
         
@@ -405,7 +391,6 @@ async function processFactCheck(chatId, query, imageBuffer = null) {
 
 // ================== 6. BOT HANDLER ==================
 
-// Hàm xử lý Reminder
 async function handleReminderCommand(chatId, text) {
   const content = text.replace(/^\/nn\s*/i, "").trim();
   if (!content) return "⚠️ Sai cú pháp. VD: `/nn 9:30`";
@@ -441,7 +426,6 @@ function parseTime(str) {
   return { h, m };
 }
 
-// Quản lý trạng thái xử lý
 const userStates = new Map();
 function setUserProcessing(chatId, isProcessing, requestId = 0) {
   if (!isProcessing) userStates.delete(chatId);
@@ -466,6 +450,25 @@ bot.on("message", async (msg) => {
   if (!text && !hasPhoto && !hasDocument) return;
   console.log(`📩 [${chatId}] ${text.substring(0, 30)}...`);
 
+  // [MỚI] Lệnh /ver đọc file json
+  if (text.trim().toLowerCase() === "/ver") {
+      try {
+          if (fs.existsSync('./version.json')) {
+              const raw = fs.readFileSync('./version.json');
+              const data = JSON.parse(raw);
+              let reply = `🤖 **Bot Info:**\n`;
+              for (const [key, value] of Object.entries(data)) {
+                  reply += `- **${key}:** ${value}\n`;
+              }
+              return bot.sendMessage(chatId, reply, {parse_mode: "Markdown"});
+          } else {
+              return bot.sendMessage(chatId, "⚠️ Chưa có file version.json");
+          }
+      } catch (e) {
+          return bot.sendMessage(chatId, "❌ Lỗi đọc version.");
+      }
+  }
+
   // Lệnh hủy
   if (text === "//") { setUserProcessing(chatId, false); return bot.sendMessage(chatId, "✅ Đã hủy."); }
 
@@ -483,16 +486,15 @@ bot.on("message", async (msg) => {
   setUserProcessing(chatId, true, reqId);
 
   try {
-    // --- FEATURE 1: FACT CHECK (/check) [NÂNG CẤP] ---
+    // --- FEATURE 1: FACT CHECK (/check) ---
     if (text.toLowerCase().startsWith("/check") || text.toLowerCase().startsWith("/verify")) {
-        // 1. Kiểm tra giới hạn 10 lần/giờ
         const limit = usageManager.checkAndIncrement(chatId, "FACT_CHECK");
         if (!limit.allowed) {
             setUserProcessing(chatId, false);
             return bot.sendMessage(chatId, limit.message);
         }
 
-        await bot.sendMessage(chatId, `🕵️ Đang xác minh thông tin... (${limit.message})`);
+        await bot.sendMessage(chatId, `🕵️ Đang xác minh... (${limit.message})`);
         
         let imageBuffer = null;
         if (hasPhoto) {
@@ -508,13 +510,11 @@ bot.on("message", async (msg) => {
             return bot.sendMessage(chatId, "⚠️ Nhập thông tin hoặc gửi ảnh cần kiểm tra.");
         }
 
-        // 2. Chạy quy trình Fact Check mới
         const result = await processFactCheck(chatId, query, imageBuffer);
         
         if (getUserState(chatId).requestId === reqId) {
             await bot.sendMessage(chatId, result, { parse_mode: "Markdown" }).catch(() => bot.sendMessage(chatId, result));
-            // Lưu bộ nhớ
-            contextManager.addMessage(chatId, `[User Check]: ${query}`, 'user');
+            contextManager.addMessage(chatId, `[Check]: ${query}`, 'user');
             contextManager.addMessage(chatId, result, 'model');
         }
         
@@ -566,16 +566,14 @@ bot.on("message", async (msg) => {
     let contextHistory = contextManager.getFormattedContext(chatId);
     let searchContext = null;
     
-    // Lệnh /tim
     if (text.toLowerCase().startsWith("/tim")) {
         const q = text.replace(/^\/tim\s*/i, "").trim();
         await bot.sendMessage(chatId, "🌐 Đang tìm...");
-        searchContext = await performComprehensiveSearch(q); // Dùng search nâng cao luôn
+        searchContext = await performComprehensiveSearch(q); 
         text = `Trả lời câu hỏi: ${q}`;
     }
 
     let finalPrompt = text;
-    // Nếu có history và không phải search thì ghép history
     if (contextHistory && !searchContext && !text.startsWith("/")) {
         finalPrompt = `History:\n${contextHistory}\nUser: ${text}`;
     }
@@ -583,7 +581,7 @@ bot.on("message", async (msg) => {
     // Gọi AI (Hybrid)
     let ans = await askHybridAI(finalPrompt, imageBuffer, searchContext);
     
-    // Gửi tin nhắn an toàn (chia nhỏ nếu dài)
+    // Gửi tin nhắn an toàn
     const sendSafe = async (txt) => {
         try { await bot.sendMessage(chatId, txt, { parse_mode: "Markdown" }); } 
         catch { await bot.sendMessage(chatId, txt); }
@@ -595,7 +593,6 @@ bot.on("message", async (msg) => {
         await sendSafe(ans);
     }
 
-    // Lưu bộ nhớ
     if (!text.startsWith("/")) {
         contextManager.addMessage(chatId, hasPhoto ? "[Gửi ảnh]" : text, 'user');
         contextManager.addMessage(chatId, ans, 'model');
@@ -609,9 +606,8 @@ bot.on("message", async (msg) => {
   }
 });
 
-// ================== 7. SERVER (GIỮ ĐỂ PING GITHUB) ==================
+// ================== 7. SERVER ==================
 
-// Sheet Reminder Loop
 async function getRemindersFromSheet() {
     try { return await (await fetch(GAS_URL)).json(); } catch { return []; }
 }
