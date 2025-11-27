@@ -14,7 +14,9 @@ const {
   TELEGRAM_TOKEN,
   GOOGLE_CHAT_KEYS,
   VOICERSS_KEYS,
-  SERPER_API_KEY,    // KEY SERPER (TÌM KIẾM)
+  SERPER_API_KEY,
+  GROQ_API_KEY,
+  OPENROUTER_API_KEY,
   SELF_PING_URL,
   GOOGLE_APP_SCRIPT_URL: GAS_URL,
   PORT = 3000
@@ -28,13 +30,14 @@ if (!TELEGRAM_TOKEN || !GOOGLE_CHAT_KEYS || !GAS_URL) {
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; 
 const REQUEST_TIMEOUT = 60000; 
-const MODEL_CHAT = "gemini-2.0-flash"; // Dùng bản Flash mới nhất cho nhanh
+// [FIX 1] Dùng bản 1.5 ổn định (Google chưa public 2.5)
+const MODEL_GEMINI = "gemini-2.5-flash"; 
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const app = express();
 app.use(express.json());
 
-// ================== 2. QUẢN LÝ KEY (SMART ROTATION) ==================
+// ================== 2. QUẢN LÝ KEY & BỘ NHỚ ==================
 
 // 2.1 Quản lý Key GEMINI
 class KeyManager {
@@ -64,13 +67,13 @@ class KeyManager {
         const msg = (error.message || "").toLowerCase();
         console.error(`🔴 [${this.name}] Lỗi:`, msg);
         
-        if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted")) {
+        if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted") || msg.includes("overloaded")) {
           if (this.keys.length === 1) {
-            await new Promise(r => setTimeout(r, 5000)); // Đợi 5s nếu chỉ có 1 key
+            await new Promise(r => setTimeout(r, 5000));
             attempts--;
             continue;
           }
-          this.rotate(); // Đổi key nếu có nhiều key
+          this.rotate();
           attempts--;
         } else {
           throw error;
@@ -101,8 +104,71 @@ class VoiceKeyManager {
   }
 }
 
+// 2.3 [NEW] Quản lý ngữ cảnh Chat (Memory) - Tối ưu RAM
+class ChatContextManager {
+  constructor(maxMessages = 6, maxWords = 150) {
+    this.userContexts = new Map(); 
+    this.maxMessages = maxMessages; // Nhớ 6 câu (3 cặp hỏi đáp)
+    this.maxWords = maxWords;       // Giới hạn từ mỗi câu
+    
+    // Tự động dọn dẹp mỗi 5 phút
+    setInterval(() => this.cleanupInactiveUsers(), 5 * 60 * 1000);
+  }
+
+  // Thêm tin nhắn vào bộ nhớ
+  addMessage(userId, content, role = 'user') {
+    const truncatedContent = this._truncateMessage(content);
+    const now = Date.now();
+
+    let ctx = this.userContexts.get(userId);
+    if (!ctx) {
+      ctx = { messages: [], lastActive: now };
+    }
+
+    ctx.messages.push({ role, content: truncatedContent });
+
+    // Sliding Window: Xóa tin cũ nếu vượt quá giới hạn
+    if (ctx.messages.length > this.maxMessages) {
+      ctx.messages.shift();
+    }
+
+    ctx.lastActive = now;
+    this.userContexts.set(userId, ctx);
+  }
+
+  // Lấy lịch sử để gửi kèm Prompt
+  getFormattedContext(userId) {
+    const ctx = this.userContexts.get(userId);
+    if (!ctx || ctx.messages.length === 0) return "";
+
+    return ctx.messages
+      .map(m => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.content}`)
+      .join("\n");
+  }
+
+  // Cắt ngắn tin nhắn để tiết kiệm Token/RAM
+  _truncateMessage(message) {
+    if (!message) return "";
+    return message.trim().split(/\s+/).slice(0, this.maxWords).join(' ');
+  }
+
+  // Dọn rác (Garbage Collection)
+  cleanupInactiveUsers(maxAgeMs = 10 * 60 * 1000) { // 10 phút expire
+    const now = Date.now();
+    let count = 0;
+    for (const [userId, ctx] of this.userContexts.entries()) {
+      if (now - ctx.lastActive > maxAgeMs) {
+        this.userContexts.delete(userId);
+        count++;
+      }
+    }
+    if (count > 0) console.log(`🧹 [MEMORY] Đã dọn dẹp bộ nhớ của ${count} user.`);
+  }
+}
+
 const chatManager = new KeyManager(GOOGLE_CHAT_KEYS, "CHAT-GEMINI");
 const voiceManager = new VoiceKeyManager(VOICERSS_KEYS);
+const contextManager = new ChatContextManager(); // Khởi tạo bộ nhớ
 
 // ================== 3. TIỆN ÍCH MẠNG ==================
 
@@ -168,98 +234,162 @@ function getUserState(chatId) {
   return userStates.get(chatId) || { isProcessing: false, requestId: 0 };
 }
 
-// ================== 6. AI & MEDIA LOGIC ==================
+// ================== 6. AI LOGIC (HYBRID ROTATION) ==================
 
-// 6.1 Chat Gemini (Xử lý Context từ Google Search)
-async function askGemini(promptText, imageBuffer = null, searchContext = null) {
-  return chatManager.executeWithRetry(async (client) => {
-    const model = client.getGenerativeModel({ model: MODEL_CHAT });
-    const parts = [];
-    if (imageBuffer) parts.push(fileToGenerativePart(imageBuffer, "image/jpeg"));
-    
-    // Nếu có thông tin tìm kiếm, chèn vào prompt hệ thống
-    let systemPrompt = "Bạn là trợ lý ảo thông minh.";
+function buildSystemPrompt(searchContext) {
+    let systemPrompt = "Bạn là trợ lý ảo thông minh, hữu ích và thân thiện. Hãy trả lời ngắn gọn, đúng trọng tâm.";
     if (searchContext) {
-      systemPrompt += `\n[THÔNG TIN TỪ GOOGLE]\n${searchContext}\n\nHãy trả lời câu hỏi của người dùng dựa trên thông tin trên. Nếu có số liệu, hãy trích dẫn nguồn hoặc tiêu đề bài viết.`;
+      systemPrompt += `\n\n[DỮ LIỆU TÌM KIẾM]\n${searchContext}\n\nHãy trả lời dựa trên thông tin trên. Trích dẫn nguồn nếu có.`;
     }
-
-    if (!promptText && imageBuffer) promptText = "Mô tả ảnh này.";
-    parts.push({ text: `${systemPrompt}\n\nUser: ${promptText || "Xin chào"}` });
-    
-    const result = await model.generateContent(parts);
-    return result.response.text();
-  });
+    return systemPrompt;
 }
 
-// 6.2 TÌM KIẾM GOOGLE (SERPER API) - QUAN TRỌNG NHẤT
+// 6.1 Gọi Groq API (Ưu tiên 1)
+async function callGroq(prompt, systemPrompt) {
+    if (!GROQ_API_KEY) throw new Error("No Groq Key");
+    
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${GROQ_API_KEY}`,
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            model: "llama-3.3-70b-versatile", 
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: prompt }
+            ],
+            temperature: 0.7,
+            max_tokens: 1024
+        })
+    });
+
+    if (!response.ok) {
+         const err = await response.text();
+         throw new Error(`Groq ${response.status}: ${err}`);
+    }
+    const data = await response.json();
+    return data.choices[0].message.content;
+}
+
+// 6.2 Gọi OpenRouter API (Ưu tiên 3)
+async function callOpenRouter(prompt, systemPrompt) {
+    if (!OPENROUTER_API_KEY) throw new Error("No OpenRouter Key");
+
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://telegram.org", 
+        },
+        body: JSON.stringify({
+            model: "google/gemini-2.0-flash-lite-preview-02-05:free", 
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: prompt }
+            ]
+        })
+    });
+
+    if (!response.ok) throw new Error(`OpenRouter ${response.status}`);
+    const data = await response.json();
+    return data.choices[0].message.content;
+}
+
+// 6.3 Gọi Gemini API (Ưu tiên 2 & Vision)
+async function callGemini(prompt, imageBuffer, systemPrompt) {
+    return chatManager.executeWithRetry(async (client) => {
+        const model = client.getGenerativeModel({ model: MODEL_GEMINI });
+        const parts = [];
+        if (imageBuffer) parts.push(fileToGenerativePart(imageBuffer, "image/jpeg"));
+        
+        if (!prompt && imageBuffer) prompt = "Mô tả ảnh này.";
+        parts.push({ text: `${systemPrompt}\n\nUser: ${prompt || "Xin chào"}` });
+        
+        const result = await model.generateContent(parts);
+        return result.response.text();
+    });
+}
+
+// 6.4 MASTER FUNCTION
+async function askHybridAI(promptText, imageBuffer = null, searchContext = null) {
+    const systemPrompt = buildSystemPrompt(searchContext);
+
+    // TH1: Có ảnh -> Dùng Gemini
+    if (imageBuffer) {
+        return await callGemini(promptText, imageBuffer, systemPrompt);
+    }
+
+    // TH2: Text Only -> Groq -> Gemini -> OpenRouter
+    try {
+        // Bước 1: Groq
+        console.log("⚡ Thử Groq...");
+        return await callGroq(promptText, systemPrompt);
+    } catch (e) {
+        console.warn(`⚠️ Groq lỗi (${e.message}). Chuyển sang Gemini...`);
+    }
+
+    try {
+        // Bước 2: Gemini
+        console.log("💎 Thử Gemini...");
+        return await callGemini(promptText, null, systemPrompt);
+    } catch (e) {
+        console.warn(`⚠️ Gemini lỗi (${e.message}). Chuyển sang OpenRouter...`);
+    }
+
+    try {
+        // Bước 3: OpenRouter
+        console.log("🌐 Thử OpenRouter...");
+        return await callOpenRouter(promptText, systemPrompt);
+    } catch (e) {
+        console.error(`❌ OpenRouter lỗi: ${e.message}`);
+        throw new Error("Tất cả server AI đều bận.");
+    }
+}
+
+// ================== 7. TÍNH NĂNG KHÁC ==================
+
+// 7.1 Search
 async function performSearch(query) {
     if (!SERPER_API_KEY) {
-        console.error("❌ CHƯA CÓ SERPER_API_KEY TRONG FILE .ENV");
+        console.error("❌ CHƯA CÓ SERPER_API_KEY");
         return null;
     }
-    
     try {
         const myHeaders = new Headers();
         myHeaders.append("X-API-KEY", SERPER_API_KEY);
         myHeaders.append("Content-Type", "application/json");
 
-        const raw = JSON.stringify({
-            "q": query,
-            "gl": "vn",    // Vị trí: Việt Nam
-            "hl": "vi",    // Ngôn ngữ: Tiếng Việt
-            "num": 5       // Lấy 5 kết quả
-        });
-
-        const requestOptions = {
-            method: 'POST',
-            headers: myHeaders,
-            body: raw,
-            redirect: 'follow'
-        };
-
-        // Gọi API Serper
+        const raw = JSON.stringify({ "q": query, "gl": "vn", "hl": "vi", "num": 5 });
+        const requestOptions = { method: 'POST', headers: myHeaders, body: raw, redirect: 'follow' };
+        
         const res = await fetch("https://google.serper.dev/search", requestOptions);
         if (!res.ok) throw new Error(`Lỗi Serper API: ${res.status}`);
         
         const data = await res.json();
-        
-        // Kiểm tra kết quả
         if (!data.organic || data.organic.length === 0) return null;
 
         let context = "";
-        
-        // 1. Lấy câu trả lời nhanh (nếu có)
-        if (data.answerBox) {
-            context += `💡 TRẢ LỜI NHANH: ${data.answerBox.title || ""} - ${data.answerBox.snippet || data.answerBox.answer || ""}\n\n`;
-        }
-        
-        // 2. Lấy danh sách bài viết (Title + Link + Snippet)
-        context += data.organic.map((r, index) => 
-            `[${index + 1}] ${r.title}\nLink: ${r.link}\nNội dung: ${r.snippet}`
-        ).join("\n\n");
-
+        if (data.answerBox) context += `💡 TRẢ LỜI NHANH: ${data.answerBox.title || ""} - ${data.answerBox.snippet || data.answerBox.answer || ""}\n\n`;
+        context += data.organic.map((r, index) => `[${index + 1}] ${r.title}\nLink: ${r.link}\nNội dung: ${r.snippet}`).join("\n\n");
         return context;
-
     } catch (e) {
-        console.error("Lỗi tìm kiếm Serper:", e.message);
+        console.error("Lỗi tìm kiếm:", e.message);
         return null;
     }
 }
 
-// 6.3 Tạo ảnh (Flux - Pollinations)
+// 7.2 Image Gen
 async function generateImage(prompt) {
     const randomSeed = Math.floor(Math.random() * 1000000);
     const encodedPrompt = encodeURIComponent(prompt);
-    
-    // Danh sách nguồn vẽ dự phòng
     const urls = [
         `https://image.pollinations.ai/prompt/${encodedPrompt}?model=flux&width=1024&height=1024&seed=${randomSeed}&nologo=true`,
-        `https://image.pollinations.ai/prompt/${encodedPrompt}?model=turbo&seed=${randomSeed}&nologo=true`,
-        `https://image.pollinations.ai/prompt/${encodedPrompt}?seed=${randomSeed}&nologo=true`
+        `https://image.pollinations.ai/prompt/${encodedPrompt}?model=turbo&seed=${randomSeed}&nologo=true`
     ];
-    
     const agent = new https.Agent({ rejectUnauthorized: false });
-
     const tryFetchImage = async (url) => {
         const controller = new AbortController();
         const id = setTimeout(() => controller.abort(), 40000); 
@@ -271,23 +401,16 @@ async function generateImage(prompt) {
             if (arrayBuffer.byteLength < 1000) throw new Error("Ảnh lỗi");
             return Buffer.from(arrayBuffer);
         } catch (error) {
-            clearTimeout(id);
-            throw error;
+            clearTimeout(id); throw error;
         }
     };
-
     for (let i = 0; i < urls.length; i++) {
-        try {
-            const buffer = await tryFetchImage(urls[i]);
-            return { buffer: buffer };
-        } catch (err) {
-            // Thử link tiếp theo nếu lỗi
-        }
+        try { return { buffer: await tryFetchImage(urls[i]) }; } catch (err) {}
     }
-    throw new Error("Server vẽ đang bận, thử lại sau.");
+    throw new Error("Server vẽ bận.");
 }
 
-// 6.4 Tạo giọng nói (VoiceRSS - Có xoay vòng)
+// 7.3 Voice
 async function generateVoice(text) {
   let attempts = voiceManager.keys.length > 0 ? voiceManager.keys.length : 1;
   while (attempts > 0) {
@@ -297,28 +420,20 @@ async function generateVoice(text) {
       const res = await fetchWithTimeout(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buffer = Buffer.from(await res.arrayBuffer());
-      
-      // Check lỗi Text trả về thay vì Audio
-      if (buffer.length < 300) {
-         const errText = buffer.toString('utf-8');
-         if (errText.startsWith("ERROR")) throw new Error(errText);
-      }
+      if (buffer.length < 300 && buffer.toString('utf-8').startsWith("ERROR")) throw new Error(buffer.toString('utf-8'));
       return buffer;
     } catch (error) {
-      // Nếu lỗi do Key/Quota thì đổi Key
       if (voiceManager.keys.length > 1) {
           console.warn(`⚠️ Voice Key lỗi: ${error.message}. Đang đổi Key...`);
-          voiceManager.rotate();
-          attempts--;
-          continue;
+          voiceManager.rotate(); attempts--; continue;
       }
       throw error;
     }
   }
-  throw new Error("Tất cả Key VoiceRSS đều lỗi hoặc hết lượt.");
+  throw new Error("Tất cả Key VoiceRSS lỗi.");
 }
 
-// ================== 7. XỬ LÝ TIN NHẮN (BOT HANDLER) ==================
+// ================== 8. BOT HANDLER (FIXED CRASH & MEMORY) ==================
 
 async function handleReminderCommand(chatId, text) {
   const content = text.replace(/^\/nn\s*/i, "").trim();
@@ -355,13 +470,11 @@ bot.on("message", async (msg) => {
   if (!text && !hasPhoto && !hasDocument) return;
   console.log(`📩 [${chatId}] ${text.substring(0, 30)}...`);
 
-  // Hủy tác vụ
   if (text.trim() === "//") {
     setUserProcessing(chatId, false);
     return bot.sendMessage(chatId, "✅ Đã hủy tác vụ.");
   }
   
-  // === CÁC LỆNH HỆ THỐNG ===
   if (text.toLowerCase().startsWith("/nn")) {
     const r = await handleReminderCommand(chatId, text);
     return bot.sendMessage(chatId, r, { parse_mode: "Markdown" });
@@ -380,7 +493,6 @@ bot.on("message", async (msg) => {
     return bot.sendMessage(chatId, `🗑️ Đã xóa mã \`${id}\`.`);
   }
 
-  // === AI XỬ LÝ (Chat, Ảnh, Voice, Tìm kiếm) ===
   const state = getUserState(chatId);
   if (state.isProcessing) return bot.sendMessage(chatId, "⚠️ Đang bận (gõ `//` để hủy).");
 
@@ -388,60 +500,45 @@ bot.on("message", async (msg) => {
   setUserProcessing(chatId, true, reqId);
 
   try {
-    // 1. TẠO ẢNH (FLUX)
+    // 1. TẠO ẢNH
     if (text.match(/^\/img|^\/image/i)) {
       const prompt = text.replace(/^\/(img|image)\s*/i, "").trim();
       if(!prompt) { setUserProcessing(chatId, false); return bot.sendMessage(chatId, "⚠️ Thiếu mô tả ảnh."); }
-      await bot.sendMessage(chatId, "🎨 Đang vẽ (Chế độ FLUX)...");
-      
+      await bot.sendMessage(chatId, "🎨 Đang vẽ (FLUX)...");
       const img = await generateImage(prompt);
-      
-      if (getUserState(chatId).requestId === reqId) {
-        await bot.sendPhoto(chatId, img.buffer, { caption: `Prompt: ${prompt}\n✨ Model: FLUX` });
-      }
+      if (getUserState(chatId).requestId === reqId) await bot.sendPhoto(chatId, img.buffer);
       setUserProcessing(chatId, false);
       return;
     }
 
-    // 2. GIỌNG NÓI (VOICE RSS)
+    // 2. GIỌNG NÓI
     if (text.toLowerCase().startsWith("/voi")) {
       const contentToSpeak = text.replace(/^\/voi\s*/i, "").trim();
       if(!contentToSpeak) { setUserProcessing(chatId, false); return bot.sendMessage(chatId, "⚠️ Nhập nội dung cần đọc."); }
       await bot.sendChatAction(chatId, "record_voice");
-      
       const audioBuffer = await generateVoice(contentToSpeak);
-      
-      if (getUserState(chatId).requestId === reqId) {
-        await bot.sendVoice(chatId, audioBuffer);
-      }
+      if (getUserState(chatId).requestId === reqId) await bot.sendVoice(chatId, audioBuffer);
       setUserProcessing(chatId, false);
       return;
     }
 
-    // 3. TÌM KIẾM GOOGLE (SERPER) - FEATURE MỚI
+    // 3. TÌM KIẾM
     let searchContext = null;
     if (text.toLowerCase().startsWith("/tim")) {
       const query = text.replace(/^\/tim\s*/i, "").trim();
-      if(!query) { setUserProcessing(chatId, false); return bot.sendMessage(chatId, "⚠️ Nhập từ khóa cần tìm."); }
-      
-      await bot.sendMessage(chatId, `🌐 Đang tìm trên Google: *${query}*...`, { parse_mode: "Markdown" });
-      
+      if(!query) { setUserProcessing(chatId, false); return bot.sendMessage(chatId, "⚠️ Nhập từ khóa."); }
+      await bot.sendMessage(chatId, `🌐 Đang tìm: *${query}*...`, { parse_mode: "Markdown" });
       const searchResults = await performSearch(query);
-      
       if (!searchResults) {
-         if (getUserState(chatId).requestId === reqId) await bot.sendMessage(chatId, "❌ Không tìm thấy kết quả hoặc lỗi Key Serper.");
+         if (getUserState(chatId).requestId === reqId) await bot.sendMessage(chatId, "❌ Không tìm thấy kết quả.");
          setUserProcessing(chatId, false);
          return;
       }
-      
-      // Lưu kết quả tìm kiếm vào biến context
       searchContext = searchResults;
-      
-      // Sửa lại câu hỏi để Gemini biết nhiệm vụ
-      text = `User tìm kiếm: "${query}".\nDựa vào các kết quả tìm kiếm mới nhất dưới đây, hãy tổng hợp câu trả lời chi tiết và chính xác nhất cho User.`;
+      text = `User tìm kiếm: "${query}". Tổng hợp câu trả lời chi tiết.`;
     }
 
-    // 4. CHAT GEMINI (Và xử lý File/Ảnh)
+    // 4. CHAT AI HYBRID
     let imageBuffer = null;
     if (hasDocument) await bot.sendMessage(chatId, "📂 Đang đọc file...");
     else if (hasPhoto) await bot.sendMessage(chatId, "👁️ Đang xem ảnh...");
@@ -462,32 +559,48 @@ bot.on("message", async (msg) => {
 
     if (getUserState(chatId).requestId !== reqId) return;
 
-    // Gọi Gemini (Truyền thêm searchContext nếu có)
-    const ans = await askGemini(text, imageBuffer, searchContext);
+    // --- [NEW] CHUẨN BỊ CONTEXT (BỘ NHỚ NGẮN HẠN) ---
+    // Chỉ lấy lịch sử khi không phải search/ảnh/file để tránh nhiễu
+    let finalPrompt = text;
+    let contextHistory = "";
+    
+    if (!searchContext && !imageBuffer && !hasDocument && !text.startsWith("/")) {
+       contextHistory = contextManager.getFormattedContext(chatId);
+       if (contextHistory) {
+         // Ghép lịch sử vào prompt
+         finalPrompt = `Dưới đây là lịch sử chat trước đó (để bạn hiểu ngữ cảnh):\n---\n${contextHistory}\n---\nCâu hỏi hiện tại của User: ${text}`;
+       }
+    }
 
-    // ================== FIXED ERROR 400 HERE ==================
+    // --- CALL AI ---
+    let ans = await askHybridAI(finalPrompt, imageBuffer, searchContext);
+
+    // [FIX 4] CHỐNG CRASH TELEGRAM KHI AI TRẢ VỀ RỖNG
+    if (!ans || ans.trim().length === 0) {
+        ans = "⚠️ Các hệ thống AI đang bận hoặc không phản hồi. Vui lòng thử lại.";
+    }
+
     if (getUserState(chatId).requestId === reqId) {
-      
-      // Hàm gửi tin nhắn an toàn (Tự động chuyển text thường nếu Markdown lỗi)
       const sendSafeMessage = async (contentStr) => {
-        try {
-          await bot.sendMessage(chatId, contentStr, { parse_mode: "Markdown" });
-        } catch (e) {
-          console.warn(`⚠️ Markdown lỗi (${e.message}), đang gửi lại dạng text thô...`);
-          // Gửi lại không dùng parse_mode
-          await bot.sendMessage(chatId, contentStr); 
-        }
+        try { await bot.sendMessage(chatId, contentStr, { parse_mode: "Markdown" }); } 
+        catch (e) { await bot.sendMessage(chatId, contentStr); } // Fallback text thường
       };
-
-      // Cắt tin nhắn nếu quá dài (Telegram giới hạn 4096 ký tự)
+      
+      // Chia nhỏ tin nhắn nếu quá dài
       if (ans.length > 4000) {
         const chunks = ans.match(/.{1,4000}/g) || [];
         for (const c of chunks) await sendSafeMessage(c);
       } else {
         await sendSafeMessage(ans);
       }
+      
+      // --- [NEW] LƯU VÀO BỘ NHỚ ---
+      // Chỉ lưu nếu là chat thường
+      if (!text.startsWith("/") && !searchContext && !imageBuffer) {
+        contextManager.addMessage(chatId, text, 'user');
+        contextManager.addMessage(chatId, ans, 'model');
+      }
     }
-    // ==========================================================
 
   } catch (err) {
     console.error(`User ${chatId} Error:`, err.message);
@@ -497,7 +610,7 @@ bot.on("message", async (msg) => {
   }
 });
 
-// ================== 8. SERVER & CRON JOB ==================
+// ================== 9. SERVER ==================
 setInterval(async () => {
   const all = await getRemindersFromSheet();
   if (!all.length) return;
@@ -521,7 +634,7 @@ if (typeof SELF_PING_URL !== 'undefined' && SELF_PING_URL) {
   setInterval(() => fetch(SELF_PING_URL + "/health").catch(() => {}), 300000);
 }
 
-app.get("/", (req, res) => res.send("🤖 Bot V18 - FIX ERROR 400 🚀"));
+app.get("/", (req, res) => res.send("🤖 Bot V20.1 - MEMORY UPGRADE 🧠"));
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 process.on('uncaughtException', (err) => console.error(err));
 process.on('unhandledRejection', (reason) => console.error(reason));

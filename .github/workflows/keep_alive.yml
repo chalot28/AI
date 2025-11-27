@@ -1,0 +1,19 @@
+name: Keep Bot Alive 🤖
+
+# Chạy tự động theo lịch hoặc bấm nút thủ công
+on:
+  schedule:
+    # Cú pháp cron: chạy mỗi 10 phút
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # Cho phép bấm nút "Run workflow" để test
+
+jobs:
+  ping_bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render URL 🔔
+        # Thay link dưới bằng link Render bot của bạn (nhớ giữ /health hoặc /)
+        run: curl -I -m 10 https://ai-3pzc.onrender.com/health
+        
+      - name: Log Time
+        run: echo "Ping successful at $(date)"
