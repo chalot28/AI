@@ -56,7 +56,7 @@ if (!TELEGRAM_TOKEN || !GOOGLE_CHAT_KEYS || !GAS_URL) {
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; 
 const REQUEST_TIMEOUT = 60000; 
-const MODEL_GEMINI = "gemini-1.5-flash"; 
+const MODEL_GEMINI = "gemini-2.5-flash"; 
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const app = express();
