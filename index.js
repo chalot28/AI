@@ -5,7 +5,32 @@ const TelegramBot = require("node-telegram-bot-api");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const moment = require("moment-timezone");
 const https = require('https');
-const fs = require('fs'); // [MỚI] Thêm thư viện đọc file
+const fs = require('fs');
+// ... (các phần require cũ)
+
+// Lấy biến môi trường cho Google Service Account
+const {
+  GOOGLE_PROJECT_ID,
+  GOOGLE_CLIENT_EMAIL,
+  GOOGLE_PRIVATE_KEY
+} = process.env;
+
+// Hàm tạo Credentials Object chuẩn từ biến môi trường
+const getGoogleCredentials = () => {
+  if (!GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
+    console.error("❌ Thiếu thông tin Google Service Account trong .env");
+    return null;
+  }
+
+  return {
+    client_email: GOOGLE_CLIENT_EMAIL,
+    // QUAN TRỌNG: Xử lý ký tự xuống dòng cho Private Key
+    private_key: GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'), 
+    project_id: GOOGLE_PROJECT_ID
+  };
+};
+
+// ... (các phần code còn lại)
 
 // Fix lỗi fetch cho Node.js cũ
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
@@ -204,13 +229,17 @@ async function fetchWithRetry(url, retries = 3) {
   }
 }
 
-// Search Đa Chiều
-async function performComprehensiveSearch(query) {
+// [ĐÃ SỬA] Thêm tham số isVerify để tách biệt logic Search thường và Fact Check
+async function performComprehensiveSearch(query, isVerify = false) {
     if (!SERPER_API_KEY) return null;
+
+    // Nếu là chế độ Verify (fact check) thì thêm từ khóa để tìm bài đính chính/kiểm chứng
+    // Nếu là chế độ tìm thường (/tim) thì giữ nguyên query
+    const newsQuery = isVerify ? `${query} fact check` : query;
 
     const searchTypes = [
         { q: query, type: "search" },              
-        { q: `${query} fact check`, type: "news" }
+        { q: newsQuery, type: "news" }
     ];
 
     try {
@@ -361,7 +390,8 @@ async function processFactCheck(chatId, query, imageBuffer = null) {
         queryToSearch = `${query} ${extractedInfo}`.substring(0, 400); 
     }
 
-    const searchContext = await performComprehensiveSearch(queryToSearch);
+    // [ĐÃ SỬA] Gọi search với isVerify = true
+    const searchContext = await performComprehensiveSearch(queryToSearch, true);
     if (!searchContext) return "❌ Không tìm thấy thông tin nào để kiểm chứng.";
 
     const verificationPrompt = buildVerificationPrompt(queryToSearch, searchContext);
@@ -569,7 +599,9 @@ bot.on("message", async (msg) => {
     if (text.toLowerCase().startsWith("/tim")) {
         const q = text.replace(/^\/tim\s*/i, "").trim();
         await bot.sendMessage(chatId, "🌐 Đang tìm...");
-        searchContext = await performComprehensiveSearch(q); 
+        
+        // [ĐÃ SỬA] Gọi search với isVerify = false (mặc định)
+        searchContext = await performComprehensiveSearch(q, false); 
         text = `Trả lời câu hỏi: ${q}`;
     }
 
